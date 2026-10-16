@@ -102,8 +102,9 @@ def initialize():
     saveResult(state)  # Remains a valid advisory failure artifact if setup fails.
     enabled = parse_indexers(env.get('INPUT_INDEXERS'))
     source = sourceDigest(root)
-    # `indexers1` versions the cache for the indexer install commands/versions.
-    tools = f'tld{tldVersion[1:]}-go1.26.2-node24-scip-indexers1'
+    # The `scip-indexersN` suffix versions the cache for indexer install
+    # commands/versions; bump it whenever those change.
+    tools = f'tld{tldVersion[1:]}-go1.26.2-node24-scip-indexers3'
     source_input = (f"{env.get('GITHUB_REPOSITORY')}|{source}|{tools}|"
                     f"{' '.join(enabled)}|{env.get('INPUT_PREPARE_COMMAND')}")
     namespace = (f"tld-pr-v1-{env.get('RUNNER_OS')}-{env.get('RUNNER_ARCH')}-"
@@ -128,7 +129,7 @@ def generate():
     reportPath = stateDir / 'compare-report.json'
     result = subprocess.run([
         str(binaryDir / 'tld'), 'git', 'compare', repository, state['base'], state['head'],
-        '--markdown', '--depth', '0', '--max-nodes', '0', '--max-bytes', '0',
+        '--markdown', '--blast-radius', '0', '--max-nodes', '0', '--max-bytes', '0',
         '--max-elements', str(cap['elements']), '--max-connectors', str(cap['connectors']),
         '--report-json', str(reportPath), '--prepare-command', env.get('INPUT_PREPARE_COMMAND') or '',
         '--data-dir', str(dataDir)],
@@ -139,9 +140,19 @@ def generate():
     if result.returncode != 0:
         raise RuntimeError(f'tld exited {result.returncode}')
     report = json.loads(reportPath.read_text())
-    if (report.get('base') != state['base'] or report.get('head') != state['head']
-            or not isinstance(report.get('warnings'), list)):
-        raise RuntimeError('Invalid compare report')
+    if not isinstance(report, dict):
+        raise RuntimeError('Invalid compare report: expected an object')
+    # Current tld reports use canonical comparison metadata; older releases
+    # emitted the revisions at the top level.
+    comparison = report.get('comparison', report)
+    if (not isinstance(comparison, dict) or comparison.get('base') != state['base']
+            or comparison.get('head') != state['head']):
+        raise RuntimeError('Invalid compare report: base/head do not match the requested revisions')
+    if (not isinstance(report.get('warnings'), list)
+            or any(not isinstance(warning, str) for warning in report['warnings'])):
+        raise RuntimeError('Invalid compare report: warnings must be a list of strings')
+    if report.get('status') not in ('ready', 'skipped', 'empty'):
+        raise RuntimeError('Invalid compare report: unsupported status')
     payload = {'version': state['version'], 'repository': state['repository'], 'prNumber': state['prNumber'],
                'targetBase': state['targetBase'], 'base': state['base'], 'head': state['head'],
                'status': report.get('status'),
@@ -193,13 +204,10 @@ def publish():
     except Exception as error:
         summary(f'tld PR diagram artifact rejected: {error}')
         result = {**trusted, 'base': trusted['targetBase'], 'status': 'error'}
-    # Only a ready diagram is worth a comment; everything else exits clean.
-    if result.get('status') != 'ready':
-        summary(f"tld PR diagram: nothing to publish ({result.get('status')}).")
-        return
     api = GitHub(env.get('GITHUB_TOKEN'), env.get('GITHUB_API_URL'))
-    summary('tld PR diagram: comment published.' if upsertComment(api, trusted, result)
-            else 'tld PR diagram: comment not published (stale, closed, or oversized).')
+    updated = upsertComment(api, trusted, result)
+    summary(f"tld PR diagram: comment updated ({result.get('status')})." if updated
+            else 'tld PR diagram: comment unchanged.')
 
 
 def main():

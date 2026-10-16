@@ -10,10 +10,12 @@ trusted workflow. It has two modes:
 | `publish` | Verify the originating run and update one bot-owned PR comment |
 
 All bot failures are advisory. The publisher only comments when a diagram is
-ready; empty comparisons, oversized output, and setup or indexing errors are
-written to the workflow console and leave an existing comment untouched. A
-published comment contains the diagram, the compared revisions, and a link to
-the workflow run. Existing test and lint checks are independent of this bot.
+ready. A successful comment displays only the Mermaid diagram. Empty comparisons,
+oversized output, and setup or indexing errors create no new comment. If a diagram
+was already published, an unsuccessful update preserves it and adds a
+“Diagram is stale” notice. The next successful update replaces the diagram and
+removes the notice. Details are written to the workflow console. Existing test
+and lint checks are independent of this bot.
 
 The action downloads the tld release named by the `tld-version` input, which
 defaults to `latest`. The bot therefore needs no version bump when tld ships; a
@@ -159,7 +161,7 @@ run metadata prevents older publications from replacing a newer one.
 
 After merging, verify one same-repository PR and one fork PR.
 Confirm a synchronize reuses compatible snapshots and updates the existing comment, and
-temporarily lower a limit to check that the skip status replaces the diagram
+temporarily lower a limit to check that a stale notice appears below the preserved diagram
 while CI remains green.
 
 ## Local validation
@@ -167,4 +169,15 @@ while CI remains green.
 ```bash
 python3 -m unittest discover -s scripts/pr-bot -p 'test_*.py' -v
 actionlint .github/workflows/*.yml
+scripts/pr-bot/test-action-docker.sh          # end-to-end, requires Docker
 ```
+
+The Docker test builds an Ubuntu image with the toolchains the action relies on
+(Go, Node, PHP/Composer, .NET, Java, Dart, Ruby, Rust) and, using
+`scripts/pr-bot/install-tools.sh` (the same script the action runs), installs the
+tld release plus every SCIP indexer. It probes each binary, confirms `tld doctor`
+finds them all, then drives `main.py init` and `main.py generate` against a small
+Go + TypeScript fixture repository and asserts a ready Mermaid diagram. Override
+`INDEXERS` to test a subset, pin `TLD_VERSION`, or set `PLATFORM` (defaults to
+`linux/amd64`, since the `scip-clang` and `scip-ruby` releases only publish
+x86_64 Linux artifacts).
