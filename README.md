@@ -1,6 +1,6 @@
 # tld PR diagram bot
 
-A reusable GitHub composite action that generates and caches PR impact diagrams in mermaid format
+A reusable GitHub composite action that generates and caches PR impact Markdown
 with the [tld](https://github.com/Mertcikla/tld) CLI, then publishes them from a
 trusted workflow. It has two modes:
 
@@ -9,8 +9,10 @@ trusted workflow. It has two modes:
 | `generate` | Compare a PR's merge base to HEAD, restore/save snapshots, upload a result artifact |
 | `publish` | Verify the originating run and update one bot-owned PR comment |
 
-All bot failures are advisory. The publisher only comments when a diagram is
-ready. A successful comment displays only the Mermaid diagram. Empty comparisons,
+All bot failures are advisory. The publisher only comments when a comparison is
+ready. A successful comment can contain one or two Mermaid diagrams, context
+reduction notes, and changed-file lists, or a file summary when relationships
+are unavailable. Empty comparisons,
 oversized output, and setup or indexing errors create no new comment. If a diagram
 was already published, an unsuccessful update preserves it and adds a
 “Diagram is stale” notice. The next successful update replaces the diagram and
@@ -19,7 +21,13 @@ and lint checks are independent of this bot.
 
 The action downloads the tld release named by the `tld-version` input, which
 defaults to `latest`. The bot therefore needs no version bump when tld ships; a
-deployment can pin an exact tag by setting `tld-version: v2.4.2`.
+deployment can pin an exact release tag with `tld-version`.
+
+When the installed CLI advertises `git compare --auto`, the bot enables it and
+lets it choose the dependency radius. Older releases retain the previous
+radius-zero presentation, with a notice in the logs. This allows rollout before
+the new CLI is released and keeps older pinned releases usable. A failed or
+skipped auto comparison is never retried in manual mode.
 
 ## Installing in another repository
 
@@ -110,8 +118,8 @@ changes cannot change the bot code or cache namespace on a synchronize event.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `tld-version` | `latest` | tld release tag to download, or `latest` for the newest stable release |
-| `TLD_PR_MAX_ELEMENTS` | `40` | Maximum diagram nodes |
-| `TLD_PR_MAX_CONNECTORS` | `80` | Maximum diagram dependency edges |
+| `TLD_PR_MAX_ELEMENTS` | `80` | Maximum placements across the selected comparison, including listed files |
+| `TLD_PR_MAX_CONNECTORS` | `160` | Maximum connectors across the selected comparison |
 | `repository-path` | current workspace | Checkout to index |
 | `prepare-command` | empty | Bash setup inside each uncached commit worktree |
 | `indexers` | `auto` | SCIP indexers to install; `auto` installs all (go, typescript, python, dotnet, clang, java, dart, php, ruby, rust) |
@@ -121,17 +129,29 @@ changes cannot change the bot code or cache namespace on a synchronize event.
 | `github-token` | workflow token | Resolves the latest tld release and authorizes publication |
 
 Both limits must be positive integers. Zero, negatives, fractions, and malformed
-values produce an advisory configuration error. Limits are checked before
-Mermaid rendering and automatic budget shrinking. They count the requested PR
-diagram, rather than every symbol or relation in the full repository indexes.
-Equality is permitted; exceeding either limit skips the whole diagram.
+values produce an advisory configuration error. Auto mode checks limits after
+simplification and can fall back to a smaller radius. Limits apply to the whole
+selected scene, including all diagrams and listed files, rather than every
+symbol or relation in the full repository indexes. Equality is permitted; if no
+complete selection fits, the comparison is skipped. Older CLIs check the
+requested radius-zero diagram before rendering.
 
 Consumers typically read the limits from GitHub repository variables with the
 same names, falling back to 40 and 80, or set them in the action step's `env`
 block.
 
-Artifact size is capped at 256 KiB and comment size at 60 KiB. Oversized output
-becomes a short skip status. Indexer warnings omit the diagram rather than
+Auto expands small changes, trims optional unchanged context, and can split
+disconnected groups without cutting relationships. Isolated changed files can
+appear in a visible list below the diagrams; a comparison without available
+relationships becomes a complete file summary. The initial CLI policy limits
+each diagram to 24 placements and 40 connectors and declines comparisons above
+50 changed paths or 2,000 known changed lines. These policies belong to tld and
+can evolve with its releases; they are additional to the bot's configured limits.
+
+Artifact size is capped at 256 KiB and comment size at 60 KiB. Auto receives a
+59 KiB output budget, leaving room for the bot marker and signature. Oversized output
+becomes a short skip status. Auto's skip reason is preserved in the result
+artifact and generation job summary. Indexer warnings omit the diagram rather than
 presenting incomplete dependency results. Failures and reasons are logged in
 the job summary; detailed preparation/indexer output stays in the run logs.
 
@@ -158,6 +178,12 @@ commit/PR associations. It rejects mismatched artifact identities, checks the
 current HEAD and target BASE, and ignores closed/stale PRs. Artifacts are data
 only. A stable marker and `github-actions[bot]` ownership identify the comment;
 run metadata prevents older publications from replacing a newer one.
+Markdown validation accepts only the CLI's supported presentation structure:
+one Mermaid block, two numbered blocks, optional context/file sections, or a
+file summary. File entries must use escaped paths inside code tags. Arbitrary
+surrounding prose/HTML, extra fences, and Mermaid initialization directives are
+rejected. Summary-only comments are preserved and marked stale on failed updates,
+just like diagram comments.
 
 After merging, verify one same-repository PR and one fork PR.
 Confirm a synchronize reuses compatible snapshots and updates the existing comment, and
@@ -168,8 +194,14 @@ while CI remains green.
 
 ```bash
 python3 -m unittest discover -s scripts/pr-bot -p 'test_*.py' -v
+ruff check scripts/pr-bot
 actionlint .github/workflows/*.yml
+shellcheck scripts/pr-bot/docker/e2e.sh
 scripts/pr-bot/test-action-docker.sh          # end-to-end, requires Docker
+
+# Optional integration with a locally built CLI containing --auto
+TLD_PR_BOT_TEST_BINARY=/absolute/path/to/tld \
+  python3 -m unittest discover -s scripts/pr-bot -p 'test_*.py' -v
 ```
 
 The Docker test builds an Ubuntu image with the toolchains the action relies on
@@ -177,7 +209,10 @@ The Docker test builds an Ubuntu image with the toolchains the action relies on
 `scripts/pr-bot/install-tools.sh` (the same script the action runs), installs the
 tld release plus every SCIP indexer. It probes each binary, confirms `tld doctor`
 finds them all, then drives `main.py init` and `main.py generate` against a small
-Go + TypeScript fixture repository and asserts a ready Mermaid diagram. Override
+Go + TypeScript fixture repository and validates ready Markdown using the same
+validator as publication. Saved real auto outputs in `scripts/pr-bot/fixtures/`
+exercise notes, split diagrams with listed files, and summary-only comments.
+Override
 `INDEXERS` to test a subset, pin `TLD_VERSION`, or set `PLATFORM` (defaults to
 `linux/amd64`, since the `scip-clang` and `scip-ruby` releases only publish
 x86_64 Linux artifacts).

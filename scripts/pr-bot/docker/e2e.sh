@@ -275,13 +275,14 @@ echo "== asserting result artifact =="
 python3 - "$state/result/result.json" <<'PY'
 import json
 import sys
+from lib import validateResult
 
 with open(sys.argv[1]) as handle:
     result = json.load(handle)
 if result.get("status") != "ready":
     raise SystemExit(f"expected status ready, got: {result}")
-markdown = result.get("markdown", "")
-if not markdown.startswith("```mermaid\nflowchart LR"):
-    raise SystemExit(f"expected a Mermaid flowchart, got: {markdown[:200]}")
+# Exercise the same Markdown validation used by publication, including auto
+# notes, split diagrams, and summary-only output.
+validateResult(json.dumps(result), result)
 print("tld PR bot end-to-end test passed")
 PY

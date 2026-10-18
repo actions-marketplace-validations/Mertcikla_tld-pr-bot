@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from lib import commentBody, staleNotice
+from lib import commentBody, maxCommentBytes, staleNotice, validateResult
 
 script = Path(__file__).resolve().parent / 'main.py'
 
@@ -21,6 +21,11 @@ import os
 import sys
 
 args = sys.argv[1:]
+if args == ['git', 'compare', '--help']:
+    print('  --markdown emit Markdown' if os.environ.get('FAKE_NO_AUTO') else '  --auto adapt context')
+    sys.exit(0)
+with open(os.environ['FAKE_ARGUMENTS'], 'w') as handle:
+    json.dump(args, handle)
 warnings = ['indexer failed'] if os.environ.get('FAKE_WARNINGS') else []
 if os.environ.get('FAKE_ERROR'):
     sys.exit(1)
@@ -34,7 +39,7 @@ with open(args[args.index('--report-json') + 1], 'w') as handle:
     if os.environ.get('FAKE_REPORT_JSON'):
         report = json.loads(os.environ['FAKE_REPORT_JSON'])
     json.dump(report, handle)
-sys.stdout.write('```mermaid\\nflowchart LR\\n  a["A"] --> b["B"]\\n```\\n')
+sys.stdout.write(os.environ.get('FAKE_MARKDOWN', '```mermaid\\nflowchart LR\\n  a["A"] --> b["B"]\\n```\\n'))
 '''
 
 
@@ -72,6 +77,7 @@ class MainTest(unittest.TestCase):
                'GITHUB_EVENT_PATH': str(event_path), 'GITHUB_WORKSPACE': str(repo),
                'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_RUN_ID': '12', 'GITHUB_RUN_ATTEMPT': '1',
                'GITHUB_OUTPUT': str(directory / 'output'), 'GITHUB_STEP_SUMMARY': str(directory / 'summary'),
+               'FAKE_ARGUMENTS': str(directory / 'arguments.json'),
                'INPUT_MODE': 'generate', 'INPUT_TLD_VERSION': 'v2.4.2', 'INPUT_REPOSITORY_PATH': str(repo),
                'INPUT_INDEXERS': 'go', 'INPUT_TOOLS_READY': 'true'}
 
@@ -112,6 +118,55 @@ class MainTest(unittest.TestCase):
         run('generate', {'FAKE_LEGACY_REPORT': '1'})
         self.assertEqual(result()['status'], 'ready')
         self.assertIn('```mermaid', result()['markdown'])
+
+    def test_auto_invocation_and_generated_formats_reach_the_publisher(self):
+        run, result, env, _ = self.fixture()
+        for fixture in sorted((script.parent / 'fixtures').glob('auto-*.md')):
+            with self.subTest(fixture=fixture.name):
+                markdown = fixture.read_text()
+                run('generate', {'FAKE_MARKDOWN': markdown})
+                artifact = result()
+                self.assertEqual(artifact['status'], 'ready')
+                self.assertEqual(artifact['markdown'], markdown)
+                self.assertEqual(validateResult(json.dumps(artifact), artifact), artifact)
+                args = json.loads(Path(env['FAKE_ARGUMENTS']).read_text())
+                self.assertIn('--auto', args)
+                self.assertNotIn('--blast-radius', args)
+                self.assertEqual(args[args.index('--max-bytes') + 1], str(maxCommentBytes - 1024))
+
+    def test_old_binaries_fall_back_to_legacy_presentation(self):
+        run, result, env, _ = self.fixture()
+        logs = run('generate', {'FAKE_NO_AUTO': '1'})
+        self.assertEqual(result()['status'], 'ready')
+        self.assertIn('using legacy presentation', logs)
+        args = json.loads(Path(env['FAKE_ARGUMENTS']).read_text())
+        self.assertNotIn('--auto', args)
+        self.assertEqual(args[args.index('--blast-radius') + 1], '0')
+
+    def test_auto_skip_reason_is_preserved_and_does_not_retry_manually(self):
+        run, result, env, directory = self.fixture()
+        state = json.loads((directory / 'tld-pr-bot' / 'state.json').read_text())
+        reason = 'auto: change exceeds review scope (51 files)'
+        report = {'status': 'skipped', 'reason': reason, 'warnings': [],
+                  'comparison': {'base': state['base'], 'head': state['head']}}
+        run('generate', {'FAKE_REPORT_JSON': json.dumps(report)})
+        self.assertEqual(result()['status'], 'skipped')
+        self.assertEqual(result()['reason'], reason)
+        self.assertEqual(result()['markdown'], '')
+        self.assertIn(reason, Path(env['GITHUB_STEP_SUMMARY']).read_text())
+        self.assertIn('--auto', json.loads(Path(env['FAKE_ARGUMENTS']).read_text()))
+        self.assertIn('cache-ready<<TLD_OUTPUT\ntrue', Path(env['GITHUB_OUTPUT']).read_text())
+
+    @unittest.skipUnless(os.environ.get('TLD_PR_BOT_TEST_BINARY'), 'set TLD_PR_BOT_TEST_BINARY for real CLI integration')
+    def test_real_cli_auto_summary_passes_publication_validation(self):
+        run, result, _, directory = self.fixture()
+        shutil.copyfile(os.environ['TLD_PR_BOT_TEST_BINARY'], directory / 'tld-pr-bot' / 'bin' / 'tld')
+        logs = run('generate')
+        artifact = result()
+        self.assertNotIn('using legacy presentation', logs)
+        self.assertEqual(artifact['status'], 'ready', logs)
+        self.assertIn('Changed files:', artifact['markdown'])
+        self.assertEqual(validateResult(json.dumps(artifact), artifact), artifact)
 
     def test_producer_rejects_invalid_reports_without_saving_the_cache(self):
         run, result, env, directory = self.fixture()
