@@ -10,7 +10,13 @@ maxResultBytes = 256 * 1024
 maxCommentBytes = 60 * 1024
 _sha_pattern = re.compile(r'^[0-9a-f]{40}$')
 _repo_pattern = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
-_mermaid_pattern = re.compile(r'^```mermaid\r?\nflowchart LR\r?\n[\s\S]*\r?\n```\s*$')
+_trim_pattern = re.compile(r'Context trimmed: [0-9]+ unchanged elements and [0-9]+ unchanged relationships omitted\.')
+_file_pattern = re.compile(
+    r'- <code>(?:[^<>&`*\[\]\\|~\x00-\x1f\x7f]|&(?:amp|lt|gt|#(?:96|10|13|42|95|91|93|92|124|126));)+</code>'
+    r'(?: — (?:added|removed|modified))?(?: \(\+[0-9]+ / −[0-9]+\))?')
+_summary_header = 'No relationships available in the selected scope. Changed files:'
+_files_header = 'Also changed (no relationships in the selected scope):'
+_signature = '[tld diff diagram bot](https://github.com/Mertcikla/tld-pr-bot)'
 _MAX_SAFE_INTEGER = 9007199254740991
 
 # Indexer families the tld pipeline can invoke, in install order. `typescript`
@@ -94,22 +100,84 @@ def resolve_tld_version(requested, token=None, repository=None, api_url=None, fe
 
 # The publisher trusts only the identity fields it re-derives from GitHub, so
 # validateResult rechecks them against the artifact downloaded from the run.
+def validMarkdown(markdown):
+    """Accept tld's bounded presentation grammar, never arbitrary surrounding prose.
+
+    Mermaid stays fenced with the existing directive/script restrictions. The
+    only text outside fences is a known heading, reduction notice, or escaped
+    file entry. This validation runs in the trusted publisher on fork artifacts.
+    """
+    if not isinstance(markdown, str) or '%%{' in markdown or '<script' in markdown.lower():
+        return False
+    lines = markdown.replace('\r\n', '\n').strip().split('\n')
+    position = 0
+
+    def blanks():
+        nonlocal position
+        while position < len(lines) and not lines[position].strip():
+            position += 1
+
+    def take(line):
+        nonlocal position
+        blanks()
+        if position < len(lines) and lines[position] == line:
+            position += 1
+            return True
+        return False
+
+    def diagram():
+        nonlocal position
+        if not take('```mermaid') or position >= len(lines) or lines[position] != 'flowchart LR':
+            return False
+        position += 1
+        while position < len(lines):
+            line = lines[position]
+            position += 1
+            if line == '```':
+                return True
+            if '```' in line:
+                return False
+        return False
+
+    def files():
+        nonlocal position
+        count = 0
+        blanks()
+        while position < len(lines) and _file_pattern.fullmatch(lines[position]):
+            count += 1
+            position += 1
+        blanks()
+        return 1 <= count <= 50 and position == len(lines)
+
+    if _trim_pattern.fullmatch(lines[0]):
+        position += 1
+    if take(_summary_header):
+        return files()
+    if take('Change group 1 of 2 (disconnected in the selected scope):'):
+        if (not diagram() or not take('Change group 2 of 2 (disconnected in the selected scope):')
+                or not diagram()):
+            return False
+    elif not diagram():
+        return False
+    if take(_files_header):
+        return files()
+    blanks()
+    return position == len(lines)
+
+
 def validateResult(raw, trusted):
     if len(raw.encode('utf-8')) > maxResultBytes:
         raise ValueError('Result artifact is too large')
     result = json.loads(raw)
-    if (result.get('version') != 1 or result.get('repository') != trusted['repository']
+    if (not isinstance(result, dict) or result.get('version') != 1 or result.get('repository') != trusted['repository']
             or result.get('prNumber') != trusted['prNumber'] or result.get('head') != trusted['head']
             or result.get('targetBase') != trusted['targetBase']
             or not isinstance(result.get('base'), str) or not _sha_pattern.fullmatch(result['base'])
             or result.get('status') not in ('ready', 'skipped', 'empty', 'error')):
         raise ValueError('Invalid result identity or status')
     if result.get('status') == 'ready':
-        markdown = result.get('markdown')
-        if (not isinstance(markdown, str) or not _mermaid_pattern.match(markdown)
-                or '```' in markdown[10:markdown.rfind('```')]
-                or '%%{' in markdown or '<script' in markdown):
-            raise ValueError('Invalid Mermaid output')
+        if not validMarkdown(result.get('markdown')):
+            raise ValueError('Invalid comparison Markdown output')
     return result
 
 
@@ -117,7 +185,7 @@ def commentBody(result, trusted):
     if result.get('status') != 'ready':
         return None
     body = (f"{marker}\n{runMarker(trusted)}\n{(result.get('markdown') or '').strip()}"
-            '\n\n[tld diff diagram bot](https://github.com/Mertcikla/tld-pr-bot)')
+            f'\n\n{_signature}')
     return body if len(body.encode('utf-8')) <= maxCommentBytes else None
 
 
@@ -126,9 +194,16 @@ def runMarker(trusted):
 
 
 def staleCommentBody(body, trusted):
-    # Preserve the published diagram, including comments produced by older bots.
+    # Preserve legacy diagrams and current summary-only comments. An old failure
+    # message is not a successful presentation and must not gain a stale notice.
     if not re.search(r'^```mermaid\r?\n[\s\S]*?\r?\n```', body, re.MULTILINE):
-        return None
+        content = body.removesuffix(f'\n\n{staleNotice}')
+        if not content.startswith(marker + '\n') or not content.endswith('\n\n' + _signature):
+            return None
+        content = content[len(marker) + 1:-(len(_signature) + 2)]
+        content = re.sub(r'^<!-- tld-run:[0-9]+:[0-9]+ -->\n', '', content, count=1)
+        if not validMarkdown(content):
+            return None
     if re.search(r'<!-- tld-run:[0-9]+:[0-9]+ -->', body):
         body = re.sub(r'<!-- tld-run:[0-9]+:[0-9]+ -->', runMarker(trusted), body, count=1)
     else:

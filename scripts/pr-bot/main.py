@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from lib import (GitHub, digest, limits, maxResultBytes, parse_indexers, publicationContext,
+from lib import (GitHub, digest, limits, maxCommentBytes, maxResultBytes, parse_indexers, publicationContext,
                  resolve_tld_version, upsertComment, validateResult)
 
 env = os.environ
@@ -127,9 +127,17 @@ def generate():
         raise RuntimeError('tld or SCIP installation failed')
     cap = limits(env)
     reportPath = stateDir / 'compare-report.json'
+    # Capability detection keeps pinned older releases usable during rollout.
+    # Do not retry a failed auto comparison as manual: that could bypass a skip.
+    help_text = execute(str(binaryDir / 'tld'), ['git', 'compare', '--help'], repository)
+    auto = re.search(r'^\s*--auto(?:\s|$)', help_text, re.MULTILINE) is not None
+    presentation = ['--auto', '--max-bytes', str(maxCommentBytes - 1024)] if auto else [
+        '--blast-radius', '0', '--max-bytes', '0']
+    if not auto:
+        print('Installed tld does not support --auto; using legacy presentation. Upgrade tld to enable automatic context.')
     result = subprocess.run([
         str(binaryDir / 'tld'), 'git', 'compare', repository, state['base'], state['head'],
-        '--markdown', '--blast-radius', '0', '--max-nodes', '0', '--max-bytes', '0',
+        '--markdown', *presentation, '--max-nodes', '0',
         '--max-elements', str(cap['elements']), '--max-connectors', str(cap['connectors']),
         '--report-json', str(reportPath), '--prepare-command', env.get('INPUT_PREPARE_COMMAND') or '',
         '--data-dir', str(dataDir)],
@@ -159,6 +167,8 @@ def generate():
                'markdown': result.stdout if report.get('status') == 'ready' else ''}
     if report.get('status') == 'skipped':
         payload['skipReason'] = 'diagram-limit'
+        if isinstance(report.get('reason'), str):
+            payload['reason'] = report['reason']
     if report['warnings']:
         print('\n'.join(report['warnings']))
         payload['status'] = 'error'

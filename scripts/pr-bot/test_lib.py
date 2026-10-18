@@ -1,9 +1,10 @@
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from lib import (commentBody, limits, marker, parse_indexers, publicationContext, resolve_tld_version, staleNotice,
-                 supported_indexers, upsertComment, validateResult)
+                 supported_indexers, upsertComment, validateResult, validMarkdown)
 
 head = 'a' * 40
 base = 'b' * 40
@@ -11,6 +12,7 @@ trusted = {'repository': 'owner/repo', 'prNumber': 7, 'head': head, 'targetBase'
            'runAttempt': 1, 'runURL': 'https://github.com/owner/repo/actions/runs/12'}
 ready = {'version': 1, **trusted, 'base': base, 'status': 'ready',
          'markdown': '```mermaid\nflowchart LR\n  a["A"] --> b["B"]\n```\n'}
+fixtures = Path(__file__).resolve().parent / 'fixtures'
 
 
 def pr():
@@ -128,6 +130,67 @@ class LibTest(unittest.TestCase):
         body = commentBody(ready, trusted)
         self.assertEqual(body, f"{marker}\n<!-- tld-run:12:1 -->\n{ready['markdown'].strip()}"
                          '\n\n[tld diff diagram bot](https://github.com/Mertcikla/tld-pr-bot)')
+
+    def test_actual_auto_outputs_validate_and_publish_unchanged(self):
+        for fixture in sorted(fixtures.glob('auto-*.md')):
+            for newline in ['\n', '\r\n']:
+                with self.subTest(fixture=fixture.name, newline=newline):
+                    markdown = fixture.read_text().replace('\n', newline)
+                    result = {**ready, 'markdown': markdown}
+                    self.assertEqual(validateResult(json.dumps(result), trusted), result)
+                    api = api_fixture()
+                    self.assertTrue(upsertComment(api, trusted, result))
+                    self.assertIn(markdown.strip(), api.calls[-1]['body']['body'])
+
+    def test_auto_grammar_rejects_untrusted_prose_html_and_malformed_groups(self):
+        single = (fixtures / 'auto-single.md').read_text()
+        split = (fixtures / 'auto-split.md').read_text()
+        summary = (fixtures / 'auto-summary.md').read_text()
+        cases = [None, '', [], ' ',
+                 single + '\n@someone', '@someone\n' + single,
+                 single.replace('Context trimmed:', 'Please visit https://example.com:'),
+                 single.replace('flowchart LR', 'flowchart LR\n%%{init:{}}%%'),
+                 single.replace('flowchart LR', 'flowchart LR\n<ScRiPt>alert(1)</ScRiPt>'),
+                 single.replace('```mermaid', '```html'),
+                 single + '\n' + ready['markdown'],
+                 split.replace('Change group 2 of 2', 'Change group 3 of 3'),
+                 split.replace('Change group 1 of 2', 'Change group 2 of 2'),
+                 split.replace('Change group 2 of 2', '@someone\nChange group 2 of 2'),
+                 split.replace('```\n\nChange group 2', '\n\nChange group 2'),
+                 summary + '\n- <code>x</code><img src="https://example.com">',
+                 summary + '\n- <code>x</code> [link](https://example.com)',
+                 summary + '\n- <code><b>injected</b></code>',
+                 summary + '\n- <code>&unknown;</code>',
+                 summary + '\n- <code>```</code>',
+                 'No relationships available in the selected scope. Changed files:\n\n',
+                 'No relationships available in the selected scope. Changed files:\n\n' + '- <code>a</code>\n' * 51]
+        for markdown in cases:
+            with self.subTest(markdown=str(markdown)[:100]):
+                self.assertFalse(validMarkdown(markdown))
+                with self.assertRaises(ValueError):
+                    validateResult(json.dumps({**ready, 'markdown': markdown}), trusted)
+
+    def test_file_summary_accepts_escaped_paths_and_unknown_line_counts(self):
+        markdown = ('No relationships available in the selected scope. Changed files:\n\n'
+                    '- <code>a&lt;b&gt;&amp;&#96;&#10;&#13;&#42;&#95;&#91;&#93;&#92;&#124;&#126;.go</code> — added\n'
+                    '- <code>removed.go</code> — removed (+0 / −12)\n')
+        self.assertTrue(validMarkdown(markdown))
+
+    def test_auto_summaries_and_split_diagrams_survive_failed_updates(self):
+        for fixture in sorted(fixtures.glob('auto-*.md')):
+            with self.subTest(fixture=fixture.name):
+                result = {**ready, 'markdown': fixture.read_text()}
+                body = commentBody(result, {**trusted, 'runID': 11})
+                api = api_fixture(comments=[botComment(body)])
+                self.assertTrue(upsertComment(api, trusted, {**ready, 'status': 'skipped'}))
+                stale = api.calls[-1]['body']['body']
+                self.assertEqual(stale, body.replace('tld-run:11:1', 'tld-run:12:1') + '\n\n' + staleNotice)
+                again = api_fixture(comments=[botComment(stale)])
+                self.assertTrue(upsertComment(again, trusted, {**ready, 'status': 'error'}))
+                self.assertTrue(all(call['method'] == 'GET' for call in again.calls))
+                recovered = api_fixture(comments=[botComment(stale)])
+                self.assertTrue(upsertComment(recovered, trusted, result))
+                self.assertEqual(recovered.calls[-1]['body']['body'], commentBody(result, trusted))
 
     def test_unsuccessful_results_and_oversized_diagrams_create_no_comment(self):
         oversized = {**ready, 'markdown': 'x' * 90_000}
